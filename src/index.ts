@@ -66,6 +66,70 @@ app.post("/swap", async (req, res) => {
   }
 });
 
+app.post("/swap-stream", async (req, res) => {
+  const { user, message, signature } = req.body;
+
+  try {
+    // ---- 1. Verify signature ----
+    const loginMessage = "Sign in to Monad Swap";
+    const recovered = ethers.verifyMessage(loginMessage, signature);
+    if (recovered.toLowerCase() !== user.toLowerCase()) {
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+
+    // ---- 2. Save message in DB ----
+    let dbUser = await User.findOne({ address: user });
+    if (!dbUser) dbUser = await User.create({ address: user, messages: [], tokensEarned: 0 });
+    dbUser.messages.push(message);
+    await dbUser.save();
+
+    // ---- 3. Setup SSE headers ----
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    // ---- 4. Stream OpenAI response ----
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: message }],
+      stream: true,
+    });
+
+    let aiTextBuffer = "";
+
+    // For each streamed chunk
+    for await (const part of completion) {
+      const delta = part.choices[0].delta?.content;
+      if (delta) {
+        aiTextBuffer += delta;
+        res.write(delta); // <--- send exactly what AI outputs, no "data:" prefix
+      }
+    }
+
+    // ---- 5. After AI streaming finishes, calculate reward ----
+    let reward = 1;
+    const text = aiTextBuffer.toLowerCase();
+    if (text.includes("exercise") || text.includes("water")) reward = 10;
+
+    // Send tokens
+    const tx = await contract.reward(user, reward);
+    await tx.wait();
+
+    // Update DB
+    dbUser.tokensEarned += reward;
+    await dbUser.save();
+
+    // Indicate reward and done
+    res.write(`[Reward:${reward}]`);
+    res.end();
+
+  } catch (err) {
+    console.error(err);
+    if (!res.writableEnded) res.end(`[ERROR]`);
+  }
+});
+
 // --- Start Server ---
 mongoose.connect(process.env.MONGO_URI!).then(() => {
   app.listen(3000, () => console.log("Server running on http://localhost:3000"));
